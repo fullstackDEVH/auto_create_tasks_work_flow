@@ -992,15 +992,22 @@
         }
     },
     "n-LC-1-1": {
-        "status": "not_started",
+        "status": "FINISHED",
         "assigned": "None",
         "result": {
-            "S124E400288973113040203Kx1002400120230806": {
-                "A72306301887221A003": "3"
-            }
+            "S124E400288973113040203Kx1002400120230806": "None"
         }
     },
     "n-COND-2-1": {
-        "status": "INPROGRESS"
+        "status": "FINISHED"
+    },
+    "n-CK-1-1": {
+        "status": "FINISHED",
+        "assigned": "None",
+        "result": {
+            "S124E400288973113040203Kx1002400120230806": {
+                "A72306301887221A002": "5"
+            }
+        }
     }
 }
