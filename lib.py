@@ -17,15 +17,21 @@ class JobFlow:
         logger.info("Initializing jobflow")
         self.n_task = n_task
 
-        job_flow_base, node_length_clone = self.create_job_flow_by_config(
+        job_flow_base, node_length_clone, nodes_target = self.create_job_flow_by_config(
             project_config
         )
+        self.status_job = "not_started"
         self.flow = job_flow_base
         self.node_length = node_length_clone
         self.dataset: Dict = {}
         self.tasks: Dict = {}
         self.task_data: Dict = {}
+        self.nodes_target: Dict = nodes_target
         self.batchs: Dict = {"data": [], "current_index_batch": None}
+
+    @staticmethod
+    def add_suffix(lst, suffix):
+        return [item + suffix for item in lst]
 
     def create_job_flow_by_config(self, project_config: Dict):
         logger.info("create_job_flow_by_config called")
@@ -36,6 +42,7 @@ class JobFlow:
         edges: Dict = project_config["edges"]
 
         job_flow_base: Dict = {}
+        nodes_target: Dict = {}
 
         for node in nodes:
             source_node_id = node["id"]
@@ -47,6 +54,10 @@ class JobFlow:
             for edge in edges:
                 source_edge_id = edge["source"]
                 target_edge_id = edge["target"]
+
+                nodes_target[target_edge_id] = nodes_target.get(target_edge_id, [])
+                if source_edge_id not in nodes_target[target_edge_id]:
+                    nodes_target[target_edge_id].append(source_edge_id)
 
                 if source_node_id != source_edge_id:
                     continue
@@ -62,7 +73,7 @@ class JobFlow:
                     job_flow_base[source_edge_id] = [child_flow]
                 else:
                     job_flow_base[source_edge_id].append(child_flow)
-        return job_flow_base, node_length_clone
+        return job_flow_base, node_length_clone, nodes_target
 
     def extract_zip_and_create_folder_contain_file(self, zip_file):
         with zipfile.ZipFile(zip_file, "r") as zip_ref:
@@ -264,11 +275,59 @@ class JobFlow:
 
         self.task_data[target_name] = task_data
 
+    def restore_task_data(self):
+        for task_name in self.task_data:
+            if "OCR" not in task_name:
+                self.task_data[task_name]["status"] = "not_started"
+
+    def check_all_task_data_is_finished(self):
+        is_finished = True
+        for task_name, values in self.task_data.items():
+            if "START" not in task_name and "END" not in task_name:
+                if values["status"] != "FINISHED":
+                    is_finished = False
+                    break
+        return is_finished
+
     def lop(self, name_flow: str, index_data_set: int) -> Dict:
         current_batch_working = self.get_current_batch_working()
         current_task: Dict = self.get_current_task(name_flow, index_data_set)
-
+        # handle mapping cho các node đến target
         if current_task.get("status", None) == "FINISHED":
+            """
+            current node không phải COND
+            nếu target của node hiênj tại khác COND, và status != Finished hoặc open
+            thì đẩy kết quả hiện tại của node lên các target
+            """
+            if "COND" not in name_flow and "OCR" not in name_flow:
+                current_task_name = f"{name_flow}-{index_data_set}"
+                result_current_node = self.task_data.get(current_task_name, {})[
+                    "result"
+                ]
+                data = result_current_node.get(current_batch_working, {})
+
+                if len(result_current_node) > 0:
+                    target_node_by_flow = self.flow[name_flow]
+
+                    for node_flow in target_node_by_flow:
+                        target = node_flow["target_id"]
+                        target_task_name = f"{target}-{index_data_set}"
+
+                        if (
+                            "COND" not in target_task_name
+                            and "END" not in target_task_name
+                            and self.task_data[target_task_name]["status"] != "FINISHED"
+                            # and self.task_data[target_task_name]["status"] != "open"
+                        ):
+                            self.task_data[target_task_name]["result"][
+                                current_batch_working
+                            ] = self.task_data[target_task_name]["result"].get(
+                                current_batch_working, {}
+                            )
+                            self.task_data[target_task_name]["result"][
+                                current_batch_working
+                            ].update(data)
+
             self.open_base_task_by_flow(name_flow)
             return current_task
 
@@ -278,12 +337,9 @@ class JobFlow:
             self.open_base_task_by_flow(name_flow)
 
         elif "COND" in name_flow:
-            node_name_has_target_is_COND: Dict = []
-
-            for k, v in self.flow.items():
-                for t in v:
-                    if t["target_id"] == name_flow:
-                        node_name_has_target_is_COND.append(f"{k}-{index_data_set}")
+            node_name_has_target_is_COND: List = self.add_suffix(
+                self.nodes_target[name_flow], f"-{index_data_set}"
+            )
             # Kiểm tra nếu đầu vào của COND có đầy đủ, nếu không thì dừng flow của task
             is_continue: bool = self.check_pass_flow(node_name_has_target_is_COND)
 
@@ -314,8 +370,9 @@ class JobFlow:
                 task_data = {"status": "not_started", "assigned": None, "result": {}}
                 target_name = f"{new_flow_target}-{index_data_set}"
 
-                task_data["result"] = task_data.get("result", {})
-                task_data["result"][current_batch_working] = task_data["result"].get(
+                result_value = self.task_data[target_name].get("result", {})
+                task_data["result"] = result_value
+                task_data["result"][current_batch_working] = result_value.get(
                     current_batch_working, {}
                 )
 
@@ -333,49 +390,59 @@ class JobFlow:
                     )
 
                 elif len(different) > 0 and edge_condition.lower() == "false":
+                    print(self.batchs)
+                    print(target_name)
+                    print(common, different)
                     self.update_task_data(
                         target_name, task_data, current_batch_working, different, "open"
                     )
 
                 else:
+                    # check tất cả các node có target đến target_name, phải FINISHED thì status =FINISHED or status = not_started
+                    node_name_has_target_is_OTHER: List = self.add_suffix(
+                        self.nodes_target[new_flow_target], f"-{index_data_set}"
+                    )
+                    is_continue: bool = self.check_pass_flow(
+                        node_name_has_target_is_OTHER
+                    )
+
                     self.update_task_data(
                         target_name,
                         task_data,
                         current_batch_working,
                         common,
-                        "FINISHED",
+                        "FINISHED" if is_continue == True else "not_started",
                     )
 
             self.open_base_task_by_flow(name_flow)
+
         else:
+            node_name_has_target: List = self.add_suffix(
+                self.nodes_target[name_flow], f"-{index_data_set}"
+            )
 
-            node_name_has_target: Dict = []
-
-            for k, v in self.flow.items():
-                for t in v:
-                    if t["target_id"] == name_flow:
-                        node_name_has_target.append(f"{k}-{index_data_set}")
             is_continue: bool = self.check_pass_flow(node_name_has_target)
-
             if is_continue is False:
                 current_task["status"] = "not_started"
             else:
                 if "END" in name_flow:
-                    # # tăng index batch
-                    # if self.batchs["current_index_batch"] + 1 < len(self.batchs["data"]):
-                    #     self.batchs["current_index_batch"] += 1
-                    # else :
-                    #     return current_task
-                    # # Restore task với batch mới, xóa COND trong task_data
-                    # self.open_base_task_by_flow()
-                    # name_flow = "n_START-1"
-                    #                    self.open_base_task_by_flow(name_flow)
-                    print("*** END ***")
-                    pass
+                    # Restore task với batch mới, xóa COND trong task_data
+                    # tăng index batch
+                    if (
+                        self.batchs["current_index_batch"] + 1
+                        < len(self.batchs["data"])
+                        and self.check_all_task_data_is_finished()
+                    ):
+                        self.batchs["current_index_batch"] += 1
+                    else:
+                        self.status_job = "DONE"
+                        current_task["status"] = "FINISHED"
+                        return current_task
+                    self.restore_task_data()
+                    name_flow = "n-START-1"
                 else:
                     current_task["status"] = "open"
-
-                    self.open_base_task_by_flow(name_flow)
+                self.open_base_task_by_flow(name_flow)
 
         return current_task
 
@@ -410,7 +477,7 @@ class JobFlow:
 
 
 file_path = "/home/huy/vscode/project_config.json"
-task_data_file = "/home/huy/vscode/dop_testing/task_data_lc.json"
+task_data_file = "/home/huy/vscode/dop_testing/task_data_ck.json"
 
 zipFile = "/home/huy/Downloads/0108.zip"
 
@@ -426,12 +493,14 @@ job_flow_instance = JobFlow(project_config, 1)
 job_flow_instance.import_data_working(zipFile)
 
 tasks = job_flow_instance.create_task_by_job_flow()
-job_flow_instance.open_base_task_by_flow()
+# job_flow_instance.open_base_task_by_flow()
 
-# job_flow_instance.import_tasks_data(task_data)
-# job_flow_instance.lop("n-LC-1", 1)
+job_flow_instance.import_tasks_data(task_data)
+job_flow_instance.batchs["current_index_batch"] = 2
+job_flow_instance.lop("n-LC-1", 1)
 data = job_flow_instance.export_tasks_data()
 print(data)
+print(job_flow_instance.status_job)
 
 task_base = {
     "n-OCR-1-1": {"dataset": "DATASET-1", "task_flow": "n-OCR-1"},
